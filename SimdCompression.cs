@@ -31,6 +31,7 @@ public unsafe struct SimdCompression<TSimdDiff>
             }
         }
     }
+
     public static int UnpackSmall(uint initValue, byte* inputBuf, int length, uint* outputBuf, uint bit, TSimdDiff tranform)
     {
         if (length == 0)
@@ -87,6 +88,45 @@ public unsafe struct SimdCompression<TSimdDiff>
         }
         return (int)((byte*)outputBuf - (byte*)outputUint);
     }
+
+    public static int UnpackSegmented(uint initValue, byte* inputBuf, int count, uint* outputBuf, uint bit, TSimdDiff tranform = default)
+    {
+        int i = 0;
+        var fullSize = SimdCompression.RequiredBufferSize(256, (int)bit);
+        var read = 0;
+        for (; i + 256 < count; i++)
+        {
+            var cur = outputBuf + i;
+            Unpack256(initValue, inputBuf + read, cur, bit, tranform);
+            read += fullSize;
+            initValue = cur[255];
+        }
+        if (i < count)
+        {
+            read += UnpackSmall(initValue, inputBuf + read, count - i, outputBuf + i, bit, tranform);
+        }
+        return read;
+    }
+
+    public static int PackSegmented(uint initValue, uint* inputBuf, int length, byte* outputBuf, uint bit, TSimdDiff tranform = default)
+    {
+        var fullSize = SimdCompression.RequiredBufferSize(256, (int)bit);
+        int i = 0;
+        var written = 0;
+        for (; i + 256 < length; i += 256)
+        {
+            var cur = inputBuf + i;
+            Pack256(initValue, cur, outputBuf + written, bit, tranform);
+            initValue = cur[255];
+            written += fullSize;
+        }
+        if (i < length)
+        {
+            written += PackSmall(initValue, inputBuf + i, length - i, outputBuf + written, bit, tranform);
+        }
+        return written;
+    }
+
 
     public static int PackSmall(uint initValue, uint* inputBuf, int length, byte* outputBuf, uint bit, TSimdDiff tranform = default)
     {
@@ -507,6 +547,18 @@ public unsafe struct SimdCompression<TSimdDiff>
 
 public unsafe class SimdCompression
 {
+    public static int RequireSizeSegmented(int len, int bits)
+    {
+        var total = 0;
+        int i = 0;
+        for (; i + 256 <= len; i += 256)
+        {
+            total += RequiredBufferSize(256, bits);
+        }
+        total += RequiredBufferSize(len - i, bits);
+        return total;
+    }
+
     public static int RequiredBufferSize(int len, int bits)
     {
         return bits switch

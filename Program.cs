@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Data;
 using System.Diagnostics;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -8,7 +9,7 @@ using System.Runtime.Intrinsics;
 using System.Threading.Tasks;
 using Voron.Util.Simd;
 
-var list = File.ReadLines(@"f:/postingList2.txt").Select(long.Parse).ToArray();
+var list = File.ReadLines(@"C:\Users\Oren\Downloads\976504836.txt").Select(long.Parse).ToArray();
 unsafe
 {
     fixed (long* l = list)
@@ -20,58 +21,161 @@ unsafe
 
         var b = new byte[1024];
 
-        fixed(byte* p = b)
+        var output = new long[1024];
+        fixed (long* o = output)
+        fixed (byte* p = b)
         {
             var a = fpor.Write(p, 1024);
-            Console.WriteLine(a);
+
+            var decoder = new FastPFor.Decoder(p, a.SizeUsed);
+            var read = decoder.Read(o, 1024);
+            Console.WriteLine(list.Take(1024).SequenceEqual(output));
         }
 
-    }
-}
-
-public unsafe struct FastPForDecoder
-{
-    private byte* _input;
-    private byte* _metadata;
-    private readonly byte* _end;
-    private readonly uint _exceptionsBitmap;
-    private uint _initValue;
-    private readonly ushort _sharedPrefix;
-    
-
-    public FastPForDecoder(byte* input, int size)
-    {
-        _input = input;
-        _end = input + size;
-
-        _sharedPrefix = Unsafe.Read<ushort>(input);
-        _exceptionsBitmap = Unsafe.Read<uint>(input + sizeof(ushort));
-        var metadataOffset = Unsafe.Read<uint>(input + sizeof(ushort) + sizeof(uint));
-        _metadata = metadataOffset + _input;
-        _input += sizeof(ushort) + sizeof(uint) + sizeof(uint);
-        _initValue = 0;
-    }
-
-    public int Read(long*output, int outputCount)
-    {
-        var buffer = stackalloc uint[256];
-        while (_metadata < _end)
-        {
-            var numOfBits = *_metadata++;
-            var numOfExceptions = *_metadata++;
-
-            SimdCompression<NoTransform>.Unpack256(_initValue, _input, buffer, numOfBits);
-            _input += SimdCompression.RequiredBufferSize(256, numOfBits);
-
-        }
-
-
-        return 0;
     }
 }
 
 public unsafe class FastPFor
 {
+    public unsafe struct Decoder
+    {
+        private byte* _input;
+        private byte* _metadata;
+        private readonly byte* _end;
+        private uint _initValue;
+        private fixed int _exceptionOffsets[32];
+        private readonly uint* _exceptions;
+        private readonly ushort _sharedPrefix;
+        private readonly int _prefixShiftAmount;
+        private long _previous;
+
+        public Decoder(byte* input, int size)
+        {
+            _input = input;
+            _end = input + size;
+            _previous = 0;//??
+            ref var header = ref Unsafe.AsRef<Header>(input);
+            _metadata = input + header.MetadataOffset;
+
+            if (header.SharedPrefix >= 1 << PrefixSizeBits)
+            {
+                _sharedPrefix = 0;
+                _prefixShiftAmount = 0;
+            }
+            else
+            {
+                _prefixShiftAmount = PrefixSizeBits;
+                _sharedPrefix = header.SharedPrefix;
+            }
+
+            _initValue = 0;
+
+            _exceptions = null;
+            var exceptionsBufferSize = 0;
+            var exceptionBufferOffset = 0;
+
+            var exception = _input + header.ExceptionsOffset;
+            for (int i = 2; i <= 32; i++)
+            {
+                if ((header.ExceptionsBitmap & (1 << (i - 1))) == 0)
+                    continue;
+
+                var count = Unsafe.Read<ushort>(exception);
+                exception += sizeof(ushort);
+
+                if (count + exceptionBufferOffset > exceptionsBufferSize)
+                {
+                    exceptionsBufferSize = Math.Max(exceptionsBufferSize * 2, 1024);
+                    _exceptions = (uint*)Realloc(_exceptions, exceptionsBufferSize * sizeof(uint));
+                }
+
+                SimdCompression<NoTransform>.UnpackSegmented(0, exception, count, _exceptions + exceptionBufferOffset, (uint)i);
+                _exceptionOffsets[i] = exceptionBufferOffset;
+                exceptionBufferOffset += count;
+            }
+
+            _input += sizeof(Header);
+
+        }
+
+        public int Read(long* output, int outputCount)
+        {
+            var buffer = stackalloc uint[256];
+            int read = 0;
+            while (_metadata < _end && read < outputCount)
+            {
+                var numOfBits = *_metadata++;
+                var numOfExceptions = *_metadata++;
+
+                SimdCompression<NoTransform>.Unpack256(_initValue, _input, buffer, numOfBits);
+                _input += SimdCompression.RequiredBufferSize(256, numOfBits);
+
+                if (numOfExceptions == 0)
+                    continue;
+
+                var maxNumOfBits = *_metadata++;
+                var bitsDiff = maxNumOfBits - numOfBits;
+                if (bitsDiff == 1)
+                {
+                    var mask = 1u << maxNumOfBits;
+                    for (int i = 0; i < numOfExceptions; i++)
+                    {
+                        var idx = *_metadata++;
+                        buffer[idx] |= mask;
+                    }
+                }
+                else
+                {
+                    ref var offset = ref _exceptionOffsets[bitsDiff];
+                    for (int i = 0; i < numOfExceptions; i++)
+                    {
+                        var remains = _exceptions[offset++];
+                        var idx = *_metadata++;
+                        buffer[idx] |= remains << bitsDiff;
+                    }
+                }
+
+                _initValue = buffer[255];
+
+                for (int i = 0; i + Vector256<uint>.Count < 256; i += Vector256<uint>.Count)
+                {
+                    var (a, b) = Vector256.Widen(Vector256.Load(buffer + i).AsInt32());
+                    a.Store(output + read);
+                    read += Vector256<ulong>.Count;
+                    b.Store(output + read);
+                    read += Vector256<ulong>.Count;
+                }
+
+                var sharedPrefixMask = Vector256.Create<long>(_sharedPrefix);
+                var prev = Vector256.Create(_previous);
+                for (int i = 0; i + Vector256<long>.Count < 256; i += Vector256<long>.Count)
+                {
+                    var cur = Vector256.Load(output + i);
+                    cur += Vector256.Shuffle(cur, Vector256.Create(0, 0, 1, 2)) &
+                            Vector256.Create(0, -1, -1, -1);
+                    var b = Vector256.Shuffle(cur, Vector256.Create(0, 0, 0, 1)) &
+                            Vector256.Create(0, 0, -1, -1);
+                    prev = Vector256.Shuffle(cur, Vector256.Create(3, 3, 3, 3));
+                    cur = Vector256.ShiftLeft(cur, _prefixShiftAmount) | sharedPrefixMask;
+                    cur.Store(output + i);
+                }
+            }
+
+            return read;
+        }
+    }
+
+
+    public struct Header
+    {
+        public ushort MetadataOffset;
+        public ushort ExceptionsOffset;
+        public uint ExceptionsBitmap;
+        public ushort SharedPrefix;
+    }
+
+    const int PrefixSizeBits = 10;
+
     private long* _entries;
     private byte* _entriesOutput;
     private long _entriesOutputCount = 0;
@@ -80,6 +184,7 @@ public unsafe class FastPFor
     private ushort _sharedPrefix;
     private int _consumed;
     private List<uint>[] _exceptions = new List<uint>[32];
+    private int[] _exceptionsStart = new int[32];
     private MemoryStream _metadata = new MemoryStream();
 
     public void Init(long* entries, int count)
@@ -90,6 +195,7 @@ public unsafe class FastPFor
         for (int i = 0; i < _exceptions.Length; i++)
         {
             _exceptions[i]?.Clear();
+            _exceptionsStart[i] = 0;
         }
         _metadata.SetLength(0);
 
@@ -117,7 +223,7 @@ public unsafe class FastPFor
 
         for (int j = 2; j < _exceptions.Length; j++)
         {
-            List<uint>? item = _exceptions[j];
+            var item = _exceptions[j];
             if (item == null || item.Count == 0)
                 continue;
             totalSize += SimdCompression.RequiredBufferSize(item.Count, j);
@@ -130,13 +236,15 @@ public unsafe class FastPFor
 
     public (int Count, int SizeUsed) Write(byte* output, int outputSize)
     {
-        var sizeUsed = sizeof(short) /*shared prefix*/ + sizeof(uint) /*bitmap*/ + sizeof(int) /* metadata offset */;
+        Debug.Assert(outputSize <= ushort.MaxValue, "Output buffer too large, we use ushort for offsets and don't want to overflow");
+
+        var sizeUsed = sizeof(Header);
         if (sizeUsed > outputSize)
             return default;
 
-        Unsafe.Write(output, _sharedPrefix);
-        ref var exceptionsBitmap = ref Unsafe.AsRef<uint>(output + sizeof(ushort));
-        ref var offsetToMetadata = ref Unsafe.AsRef<uint>(output + sizeof(ushort) + sizeof(uint));
+        ref var header = ref Unsafe.AsRef<Header>(output);
+
+        header.SharedPrefix = _sharedPrefix;
 
         var exceptionsCounts = stackalloc int[33];
 
@@ -149,7 +257,7 @@ public unsafe class FastPFor
         while (true)
         {
             var numOfBits = _metadata.ReadByte();
-            if (numOfBits ==-1)
+            if (numOfBits == -1)
                 break;
             var numOfExceptions = _metadata.ReadByte();
 
@@ -162,9 +270,13 @@ public unsafe class FastPFor
                 var oldCount = exceptionsCounts[exceptionIndex];
                 var newCount = oldCount + numOfExceptions;
                 exceptionsCounts[exceptionIndex] = newCount;
+                if (oldCount == 0)
+                {
+                    exceptionsRequiredSize += sizeof(ushort); // size for the number of items here
+                }
 
-                exceptionsRequiredSize -= SimdCompression.RequiredBufferSize(oldCount, maxNumOfBits);
-                exceptionsRequiredSize += SimdCompression.RequiredBufferSize(newCount, maxNumOfBits);
+                exceptionsRequiredSize -= SimdCompression.RequireSizeSegmented(oldCount, maxNumOfBits);
+                exceptionsRequiredSize += SimdCompression.RequireSizeSegmented(newCount, maxNumOfBits);
             }
 
             _metadata.Seek(numOfExceptions, SeekOrigin.Current);
@@ -182,24 +294,29 @@ public unsafe class FastPFor
         }
 
         uint bitmap = 0;
+        header.ExceptionsOffset = checked((ushort)sizeUsed);
+
         for (int numOfBits = 2; numOfBits <= 32; numOfBits++)
         {
-            if (exceptionsCounts[numOfBits] == 0)
+            var count = exceptionsCounts[numOfBits];
+            if (count == 0)
                 continue;
 
-            bitmap |= 1u << numOfBits;
-            var exceptionsList = _exceptions[numOfBits];
-            var rangeToWrite = CollectionsMarshal.AsSpan(exceptionsList)[0..exceptionsCounts[numOfBits]];
-            fixed (uint* b = rangeToWrite)
+            bitmap |= 1u << numOfBits - 1;
+            Unsafe.Write(output + sizeUsed, (ushort)count);
+            sizeUsed += sizeof(ushort);
+            var span = CollectionsMarshal.AsSpan(_exceptions[numOfBits]);
+            var exceptionStart = _exceptionsStart[numOfBits];
+            span = span[exceptionStart..(exceptionStart + count)];
+            fixed (uint* b = span)
             {
-                sizeUsed += SimdCompression<NoTransform>.PackSmall(0, b, exceptionsCounts[numOfBits],
-                    output + sizeUsed, (uint)numOfBits);
+                sizeUsed += SimdCompression<NoTransform>.PackSegmented(0, b, span.Length, output + sizeUsed, (uint)numOfBits);
             }
-            exceptionsList.RemoveRange(0, exceptionsCounts[numOfBits]);
+            _exceptionsStart[numOfBits] += count;
         }
 
-        exceptionsBitmap = bitmap;
-        offsetToMetadata = (uint)sizeUsed;
+        header.ExceptionsBitmap = bitmap;
+        header.MetadataOffset = checked((ushort)sizeUsed);
 
         var metadataSize = (int)(_metadata.Position - startingMetadataPosition);
 
@@ -214,39 +331,7 @@ public unsafe class FastPFor
 
 
     private static byte* Allocate(uint size) => (byte*)Marshal.AllocHGlobal((int)size);
-
-    //public static bool Encode(long* entries, int count, byte* output, int outputSize)
-    //{
-    //    var metadata = new MemoryStream();
-    //    var exceptionsContainers = new List<ulong>[65];
-    //    var rle = new BinaryWriter(new MemoryStream());
-
-    //    var entriesOutput = (long*)Allocate(count * sizeof(long));
-    //    var entriesOutputAsInt = (uint*)entriesOutput;
-    //    RunLengthEncodePrefixes(entries, entriesOutput, count, rle);
-
-    //    var requiredSize = rle.BaseStream.Length;
-
-    //    var consumed = DeltaEncode(entriesOutput, count);
-
-    //    int i = 0;
-    //    for (; i + 256 <= consumed; i += 256)
-    //    {
-    //        ProcessBlock(metadata, exceptionsContainers, entriesOutputAsInt, i);
-    //    }
-    //    ulong bitmap = 0;
-    //    // zero is never a valid value, and 1 is always going to be constant, so we can assume it and not store
-    //    for (int j = 2; j <= 32; j++)
-    //    {
-    //        if (exceptionsContainers[j] != null)
-    //        {
-    //            bitmap |= 1u << (j - 1);
-    //        }
-    //        //  pack(exceptionsContainers[i]);
-    //    }
-
-    //    return true;
-    //}
+    private static void* Realloc(void* ptr, int size) => (byte*)Marshal.ReAllocHGlobal((nint)ptr, size);
 
     private int ProcessBlock(uint* currentEntries)
     {
@@ -259,16 +344,14 @@ public unsafe class FastPFor
         }
 
         uint maxVal = 1u << bestB;
-        if (_exceptions[maxB - bestB] == null)
-        {
-            _exceptions[maxB - bestB] = new List<uint>();
-        }
-        var exceptions = _exceptions[maxB - bestB];
+        ref var exceptionBuffer = ref _exceptions[maxB - bestB];
+
         for (int j = 0; j < 256; j++)
         {
             if (currentEntries[j] >= maxVal)
             {
-                exceptions.Add(currentEntries[j] >>> bestB);
+                var exList = _exceptions[maxB - bestB] ??= new();
+                exList.Add(currentEntries[j] >>> bestB);
                 _metadata.WriteByte((byte)j);
             }
         }
@@ -342,9 +425,8 @@ public unsafe class FastPFor
 
     private ushort RemoveSharedPrefix()
     {
-        const int prefixSizeBits = 10;
 
-        var maskScalar = (1L << prefixSizeBits) - 1;
+        var maskScalar = (1L << PrefixSizeBits) - 1;
         var mask = Vector256.Create<long>(maskScalar);
         var prefixScalar = *_entries & maskScalar;
         var prefix = Vector256.Create(prefixScalar);
@@ -357,7 +439,7 @@ public unsafe class FastPFor
             {
                 return NoSharedPrefix();
             }
-            Vector256.ShiftRightLogical(cur, prefixSizeBits).Store(output + i);
+            Vector256.ShiftRightLogical(cur, PrefixSizeBits).Store(output + i);
         }
 
         for (; i < _count; i++)
@@ -367,7 +449,7 @@ public unsafe class FastPFor
             {
                 return NoSharedPrefix();
             }
-            output[i] = cur >>> prefixSizeBits;
+            output[i] = cur >>> PrefixSizeBits;
         }
 
         return (ushort)prefixScalar;
