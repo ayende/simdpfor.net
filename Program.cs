@@ -1,15 +1,13 @@
-﻿using System;
-using System.Data;
+﻿using System.Data;
 using System.Diagnostics;
-using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Threading.Tasks;
+using System.Windows.Markup;
 using Voron.Util.Simd;
 
-var list = File.ReadLines(@"C:\Users\Oren\Downloads\976504836.txt").Select(long.Parse).ToArray();
+var list = File.ReadLines(@"C:\Users\ayende\Downloads\976504836.txt").Select(long.Parse).ToArray();
 unsafe
 {
     fixed (long* l = list)
@@ -42,21 +40,19 @@ public unsafe class FastPFor
         private byte* _input;
         private byte* _metadata;
         private readonly byte* _end;
-        private uint _initValue;
-        private fixed int _exceptionOffsets[32];
         private readonly uint* _exceptions;
-        private readonly ushort _sharedPrefix;
+        private long _baseline;
+        private fixed int _exceptionOffsets[32];
         private readonly int _prefixShiftAmount;
-        private long _previous;
+        private readonly ushort _sharedPrefix;
 
         public Decoder(byte* input, int size)
         {
             _input = input;
             _end = input + size;
-            _previous = 0;//??
             ref var header = ref Unsafe.AsRef<Header>(input);
             _metadata = input + header.MetadataOffset;
-
+            _baseline = header.Baseline;
             if (header.SharedPrefix >= 1 << PrefixSizeBits)
             {
                 _sharedPrefix = 0;
@@ -67,8 +63,6 @@ public unsafe class FastPFor
                 _prefixShiftAmount = PrefixSizeBits;
                 _sharedPrefix = header.SharedPrefix;
             }
-
-            _initValue = 0;
 
             _exceptions = null;
             var exceptionsBufferSize = 0;
@@ -92,6 +86,8 @@ public unsafe class FastPFor
                 SimdCompression<NoTransform>.UnpackSegmented(0, exception, count, _exceptions + exceptionBufferOffset, (uint)i);
                 _exceptionOffsets[i] = exceptionBufferOffset;
                 exceptionBufferOffset += count;
+
+                exception += SimdCompression.RequiredBufferSize(count, i);
             }
 
             _input += sizeof(Header);
@@ -107,7 +103,7 @@ public unsafe class FastPFor
                 var numOfBits = *_metadata++;
                 var numOfExceptions = *_metadata++;
 
-                SimdCompression<NoTransform>.Unpack256(_initValue, _input, buffer, numOfBits);
+                SimdCompression<NoTransform>.Unpack256(0, _input, buffer, numOfBits);
                 _input += SimdCompression.RequiredBufferSize(256, numOfBits);
 
                 if (numOfExceptions == 0)
@@ -117,7 +113,7 @@ public unsafe class FastPFor
                 var bitsDiff = maxNumOfBits - numOfBits;
                 if (bitsDiff == 1)
                 {
-                    var mask = 1u << maxNumOfBits;
+                    var mask = 1u << numOfBits;
                     for (int i = 0; i < numOfExceptions; i++)
                     {
                         var idx = *_metadata++;
@@ -131,13 +127,12 @@ public unsafe class FastPFor
                     {
                         var remains = _exceptions[offset++];
                         var idx = *_metadata++;
-                        buffer[idx] |= remains << bitsDiff;
+                        buffer[idx] |= remains << numOfBits;
                     }
                 }
 
-                _initValue = buffer[255];
 
-                for (int i = 0; i + Vector256<uint>.Count < 256; i += Vector256<uint>.Count)
+                for (int i = 0; i + Vector256<uint>.Count <= 256; i += Vector256<uint>.Count)
                 {
                     var (a, b) = Vector256.Widen(Vector256.Load(buffer + i).AsInt32());
                     a.Store(output + read);
@@ -147,14 +142,15 @@ public unsafe class FastPFor
                 }
 
                 var sharedPrefixMask = Vector256.Create<long>(_sharedPrefix);
-                var prev = Vector256.Create(_previous);
-                for (int i = 0; i + Vector256<long>.Count < 256; i += Vector256<long>.Count)
+                var prev = Vector256.Create(_baseline);
+                for (int i = 0; i + Vector256<long>.Count <= 256; i += Vector256<long>.Count)
                 {
                     var cur = Vector256.Load(output + i);
                     cur += Vector256.Shuffle(cur, Vector256.Create(0, 0, 1, 2)) &
                             Vector256.Create(0, -1, -1, -1);
-                    var b = Vector256.Shuffle(cur, Vector256.Create(0, 0, 0, 1)) &
+                    cur += Vector256.Shuffle(cur, Vector256.Create(0, 0, 0, 1)) &
                             Vector256.Create(0, 0, -1, -1);
+                    cur += prev;
                     prev = Vector256.Shuffle(cur, Vector256.Create(3, 3, 3, 3));
                     cur = Vector256.ShiftLeft(cur, _prefixShiftAmount) | sharedPrefixMask;
                     cur.Store(output + i);
@@ -168,6 +164,7 @@ public unsafe class FastPFor
 
     public struct Header
     {
+        public long Baseline;
         public ushort MetadataOffset;
         public ushort ExceptionsOffset;
         public uint ExceptionsBitmap;
@@ -202,7 +199,7 @@ public unsafe class FastPFor
         if (_entriesOutputCount < count)
         {
             var s = BitOperations.RoundUpToPowerOf2((uint)count);
-            _entriesOutput = Allocate(sizeof(long) * s);
+            _entriesOutput = (byte*)Realloc(_entriesOutput, (int)s);
             //TODO: free me!
             _entriesOutputCount = s;
         }
@@ -246,16 +243,22 @@ public unsafe class FastPFor
 
         header.SharedPrefix = _sharedPrefix;
 
-        var exceptionsCounts = stackalloc int[33];
+        var baseline = _entries[Math.Max(0, _blockNum * 256 - 1)];
+        if (header.SharedPrefix < (1 << PrefixSizeBits))
+        {
+            baseline >>= PrefixSizeBits;
+        }
 
+        header.Baseline = baseline;
+        var exceptionsCounts = stackalloc int[33];
         var startingMetadataPosition = _metadata.Position;
 
         var exceptionsRequiredSize = 0;
         var entriesOutput = (uint*)_entriesOutput;
-        uint start = entriesOutput[0];
         var oldBlockNum = _blockNum;
         while (true)
         {
+            var batchMetadataStart = _metadata.Position;
             var numOfBits = _metadata.ReadByte();
             if (numOfBits == -1)
                 break;
@@ -285,12 +288,13 @@ public unsafe class FastPFor
 
             var finalSize = (sizeUsed + reqSize + exceptionsRequiredSize + metaSize);
             if (finalSize > outputSize)
+            {
+                _metadata.Position = batchMetadataStart;
                 break;
-
-            SimdCompression<MaskEntries>.Pack256(start, entriesOutput + (_blockNum++ * 256), output + sizeUsed, (uint)numOfBits,
+            }
+            SimdCompression<MaskEntries>.Pack256(0, entriesOutput + (_blockNum++ * 256), output + sizeUsed, (uint)numOfBits,
                 new MaskEntries((1u << numOfBits) - 1));
             sizeUsed += reqSize;
-            start = entriesOutput[255];
         }
 
         uint bitmap = 0;
