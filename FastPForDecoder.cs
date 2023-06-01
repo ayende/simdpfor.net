@@ -1,4 +1,6 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using Voron.Util.Simd;
 
@@ -73,7 +75,24 @@ public unsafe struct FastPForDecoder
         int read = 0;
         while (_metadata < _end && read < outputCount)
         {
+            Debug.Assert(read + 256 <= outputCount, "We assume a minimum of 256 free spaces");
+
             var numOfBits = *_metadata++;
+
+            if(numOfBits == 255) // either a batch with delta > uint.MaxValue or remainder
+            {
+                var countOfVarintBatch = *_metadata++;
+                var prevScalar = prev.GetElement(3);
+                for (int i = 0; i < countOfVarintBatch; i++)
+                {
+                    var cur = ReadVarInt64(ref _input) + prevScalar;
+                    output[read++] = cur << _prefixShiftAmount | _sharedPrefix;
+                    prevScalar = cur;
+                }
+                prev = Vector256.Create(prevScalar);
+                continue;
+            }
+
             var numOfExceptions = *_metadata++;
 
             SimdBitPacking<NoTransform>.Unpack256(0, _input, buffer, numOfBits);
@@ -116,6 +135,7 @@ public unsafe struct FastPForDecoder
 
         void WriteToOutput(Vector256<long> cur)
         {
+            // doing prefix sum here: https://en.algorithmica.org/hpc/algorithms/prefix/
             cur += Vector256.Shuffle(cur, Vector256.Create(0, 0, 1, 2)) &
                                        Vector256.Create(0, -1, -1, -1);
             cur += Vector256.Shuffle(cur, Vector256.Create(0, 0, 0, 1)) &
@@ -126,5 +146,34 @@ public unsafe struct FastPForDecoder
             cur.Store(output + read);
             read += Vector256<long>.Count;
         }
+    }
+
+    private long ReadVarInt64(ref byte* input)
+    {
+        const int MaxBytesWithoutOverflow = 9;
+        byte byteReadJustNow;
+        ulong result = 0;
+        for (int shift = 0; shift < MaxBytesWithoutOverflow * 7; shift += 7)
+        {
+            byteReadJustNow = *input++;
+            result |= (byteReadJustNow & 0x7Ful) << shift;
+
+            if (byteReadJustNow <= 0x7Fu)
+            {
+                return (long)result; // early exit
+            }
+        }
+
+        // Read the 10th byte. Since we already read 63 bits,
+        // the value of this byte must fit within 1 bit (64 - 63),
+        // and it must not have the high bit set.
+        byteReadJustNow = *input++;
+        if (byteReadJustNow > 0b_1u)
+        {
+            throw new FormatException("Bad 7 bit value");
+        }
+
+        result |= (ulong)byteReadJustNow << (MaxBytesWithoutOverflow * 7);
+        return (long)result;
     }
 }

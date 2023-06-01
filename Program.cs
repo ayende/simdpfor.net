@@ -1,13 +1,15 @@
 ﻿using System.Data;
 using System.Windows.Markup;
 
-var list = File.ReadLines(@"C:\Users\oren\Downloads\976504836.txt").Select(long.Parse).ToArray();
+var list = File.ReadLines(@"C:\Users\oren\Downloads\976504836.txt").Select(long.Parse)
+    .ToList();
+//list.Add(list[^1] + uint.MaxValue + 10);
 unsafe
 {
-    fixed (long* l = list)
+    fixed (long* l = list.ToArray())
     {
         var fpor = new FastPForEncoder();
-        fpor.Init(l, list.Length);
+        fpor.Init(l, list.Count);
 
         Console.WriteLine(fpor.Encode());
 
