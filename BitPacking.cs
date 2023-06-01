@@ -1,4 +1,5 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using Voron.Util.Simd;
 
@@ -64,4 +65,10 @@ public unsafe static class BitPacking
         return written;
     }
 
+    public static int RequireSizeSegmented(int len, int bits)
+    {
+        Debug.Assert(bits is >= 0 and <= 32);
+        var (full, partial) = Math.DivRem(len * bits, 8);
+        return full + (partial > 0 ? 1 : 0);
+    }
 }

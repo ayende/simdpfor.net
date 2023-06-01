@@ -58,7 +58,7 @@ public unsafe struct FastPForDecoder
             _exceptionOffsets[i] = exceptionBufferOffset;
             exceptionBufferOffset += count;
 
-            exception += SimdBitPacking.RequireSizeSegmented(count, i);
+            exception += BitPacking.RequireSizeSegmented(count, i);
         }
 
         _input += sizeof(PForHeader);
@@ -79,7 +79,7 @@ public unsafe struct FastPForDecoder
 
             var numOfBits = *_metadata++;
 
-            if(numOfBits == 255) // either a batch with delta > uint.MaxValue or remainder
+            if(numOfBits == 255) // either a batch with delta > uint.MaxValue or remainder of less than 256
             {
                 var countOfVarintBatch = *_metadata++;
                 var prevScalar = prev.GetElement(3);

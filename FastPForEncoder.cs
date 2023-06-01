@@ -91,7 +91,7 @@ public unsafe class FastPForEncoder
             var item = _exceptions[j];
             if (item == null || item.Count == 0)
                 continue;
-            totalSize += SimdBitPacking.RequireSizeSegmented(item.Count, j);
+            totalSize += BitPacking.RequireSizeSegmented(item.Count, j);
         }
 
         totalSize += _metadata.Count;
@@ -186,8 +186,8 @@ public unsafe class FastPForEncoder
                     exceptionsRequiredSize += sizeof(ushort); // size for the number of items here
                 }
 
-                exceptionsRequiredSize -= SimdBitPacking.RequireSizeSegmented(oldCount, maxNumOfBits);
-                exceptionsRequiredSize += SimdBitPacking.RequireSizeSegmented(newCount, maxNumOfBits);
+                exceptionsRequiredSize -= BitPacking.RequireSizeSegmented(oldCount, maxNumOfBits);
+                exceptionsRequiredSize += BitPacking.RequireSizeSegmented(newCount, maxNumOfBits);
             }
 
             _metadataPos += numOfExceptions;
@@ -318,14 +318,16 @@ public unsafe class FastPForEncoder
         var bestCost = bestBitWidth * blockSize;
         var bestExceptionCount = 0;
         var exceptionsCount = 0;
+
+
         for (var curBitWidth = bestBitWidth - 1; curBitWidth >= 0; curBitWidth--)
         {
-            exceptionsCount += freqs[curBitWidth + 1];
-            // TODO: figure out the actual cost here
+            var currentExceptions = freqs[curBitWidth + 1];
+            exceptionsCount += currentExceptions;
+
             var curCost = exceptionsCount * exceptionOverhead +
                 exceptionsCount * (maxBitWidth - curBitWidth) +
-                curBitWidth * blockSize
-                + 8;
+                curBitWidth * blockSize;
 
             if (curCost < bestCost)
             {
