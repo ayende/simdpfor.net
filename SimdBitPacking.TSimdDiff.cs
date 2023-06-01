@@ -1,5 +1,4 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.Intrinsics;
 
@@ -7,7 +6,7 @@ namespace Voron.Util.Simd;
 
 // Based on: https://github.com/lemire/simdcomp
 
-public unsafe struct SimdCompression<TSimdDiff>
+public unsafe struct SimdBitPacking<TSimdDiff>
     where TSimdDiff : struct, ISimdTransform
 {
     public static int PackSmall(uint initValue, Span<uint> inputBuf, Span<byte> outputBuf, uint bit, TSimdDiff transform)
@@ -88,45 +87,6 @@ public unsafe struct SimdCompression<TSimdDiff>
         }
         return (int)((byte*)outputBuf - (byte*)outputUint);
     }
-
-    public static int UnpackSegmented(uint initValue, byte* inputBuf, int count, uint* outputBuf, uint bit, TSimdDiff tranform = default)
-    {
-        int i = 0;
-        var fullSize = SimdCompression.RequiredBufferSize(256, (int)bit);
-        var read = 0;
-        for (; i + 256 < count; i++)
-        {
-            var cur = outputBuf + i;
-            Unpack256(initValue, inputBuf + read, cur, bit, tranform);
-            read += fullSize;
-            initValue = cur[255];
-        }
-        if (i < count)
-        {
-            read += UnpackSmall(initValue, inputBuf + read, count - i, outputBuf + i, bit, tranform);
-        }
-        return read;
-    }
-
-    public static int PackSegmented(uint initValue, uint* inputBuf, int length, byte* outputBuf, uint bit, TSimdDiff tranform = default)
-    {
-        var fullSize = SimdCompression.RequiredBufferSize(256, (int)bit);
-        int i = 0;
-        var written = 0;
-        for (; i + 256 < length; i += 256)
-        {
-            var cur = inputBuf + i;
-            Pack256(initValue, cur, outputBuf + written, bit, tranform);
-            initValue = cur[255];
-            written += fullSize;
-        }
-        if (i < length)
-        {
-            written += PackSmall(initValue, inputBuf + i, length - i, outputBuf + written, bit, tranform);
-        }
-        return written;
-    }
-
 
     public static int PackSmall(uint initValue, uint* inputBuf, int length, byte* outputBuf, uint bit, TSimdDiff tranform = default)
     {
@@ -356,7 +316,7 @@ public unsafe struct SimdCompression<TSimdDiff>
 
     }
 
-    public static void Pack256(uint initValue, Span<uint> inputBuf, Span<byte> output, uint bit, TSimdDiff transform)
+    public static void Pack256(uint initValue, Span<uint> inputBuf, Span<byte> output, uint bit, TSimdDiff transform = default)
     {
         fixed (uint* input = inputBuf)
         {
@@ -367,7 +327,7 @@ public unsafe struct SimdCompression<TSimdDiff>
         }
     }
 
-    public static void Pack256(uint initValue, uint* inputBuf, byte* outputBuf, uint bit, TSimdDiff transform)
+    public static void Pack256(uint initValue, uint* inputBuf, byte* outputBuf, uint bit, TSimdDiff transform = default)
     {
         var initOffset = Vector256.Create(initValue);
         var input = (Vector256<uint>*)inputBuf;
@@ -543,31 +503,4 @@ public unsafe struct SimdCompression<TSimdDiff>
         }
         return 32 - (uint)BitOperations.LeadingZeroCount(scalarAcc);
     }
-}
-
-public unsafe class SimdCompression
-{
-    public static int RequireSizeSegmented(int len, int bits)
-    {
-        var total = 0;
-        int i = 0;
-        for (; i + 256 <= len; i += 256)
-        {
-            total += RequiredBufferSize(256, bits);
-        }
-        total += RequiredBufferSize(len - i, bits);
-        return total;
-    }
-
-    public static int RequiredBufferSize(int len, int bits)
-    {
-        return bits switch
-        {
-            0 => 0,
-            32 => len * sizeof(uint),
-            // aligned to 4, then multiple by 'bits', then align to 32
-            _ => ((len + 3) / 4 * bits + 31) / 32 * sizeof(Vector256<uint>)
-        };
-    }
-
 }
