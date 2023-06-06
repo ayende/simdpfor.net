@@ -1,10 +1,10 @@
 ﻿using System.Runtime.Intrinsics;
 
-namespace Voron.Util.Simd;
+namespace SimdPFor;
 
 public struct MaskEntries : ISimdTransform
 {
-    Vector256<uint> _mask;
+    private readonly Vector256<uint> _mask;
 
     public MaskEntries(uint mask)
     {

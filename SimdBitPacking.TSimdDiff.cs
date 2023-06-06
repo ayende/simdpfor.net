@@ -1,8 +1,9 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.Intrinsics;
 
-namespace Voron.Util.Simd;
+namespace SimdPFor;
 
 // Based on: https://github.com/lemire/simdcomp
 

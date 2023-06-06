@@ -1,6 +1,6 @@
 ﻿using System.Runtime.Intrinsics;
 
-namespace Voron.Util.Simd;
+namespace SimdPFor;
 
 public struct NoTransform : ISimdTransform
 {

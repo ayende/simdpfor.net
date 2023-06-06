@@ -1,16 +1,18 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
-using Voron.Util.Simd;
 
-public unsafe static class BitPacking
+namespace SimdPFor;
+
+public static unsafe class BitPacking
 {
     public static int UnpackSegmented(byte* inputBuf, int count, uint* outputBuf, uint bit)
     {
         int i = 0;
         var fullSize = (int)bit * Vector256<byte>.Count;
         var read = 0;
-        for (; i + 256 < count; i++)
+        for (; i + 256 < count; i += 256)
         {
             var cur = outputBuf + i;
             SimdBitPacking<NoTransform>.Unpack256(0, inputBuf + read, cur, bit);

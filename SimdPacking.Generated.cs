@@ -1,11 +1,12 @@
 ﻿using System.Runtime.Intrinsics;
+using SimdPFor;
 
 //*************
 // Generated using:
 //    python.exe .\simdfor.py | clang-format --style Microsoft > .\Simd.Generated.cs
 //*************
 
-namespace Voron.Util.Simd;
+namespace SimdPFor;
 
 unsafe partial struct SimdPacking<TTransform> where TTransform : struct, ISimdTransform
 {
